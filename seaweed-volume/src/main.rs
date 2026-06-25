@@ -777,22 +777,23 @@ async fn run(
         }))
     };
 
-    // Wait for servers. Use select! with &mut so the losing handle is not
-    // dropped, then await it explicitly afterward.
+    // Wait for servers. Capture the result of whichever finishes first inside
+    // the select! (binding it rather than discarding with `_`), so we never
+    // await an already-completed JoinHandle afterward — re-polling a finished
+    // JoinHandle panics with "JoinHandle polled after completion". Only the
+    // other, still-running handle is awaited explicitly.
     let mut server_err: Option<String> = None;
     let mut http_handle = http_handle;
     let mut grpc_handle = grpc_handle;
-    let grpc_finished_first = tokio::select! {
-        _ = &mut http_handle => false,
-        _ = &mut grpc_handle => true,
-    };
-    // Inspect the gRPC result (already resolved if it finished first,
-    // otherwise await it now).
-    let grpc_result = if grpc_finished_first {
-        grpc_handle.await
-    } else {
-        // HTTP finished first; gRPC is still running. Await it.
-        grpc_handle.await
+    let mut http_done = false;
+    let grpc_result = tokio::select! {
+        r = &mut grpc_handle => r,
+        _ = &mut http_handle => {
+            // HTTP finished first and is now complete; don't re-await it below.
+            http_done = true;
+            // gRPC is still running; await it to get its result.
+            grpc_handle.await
+        }
     };
     match grpc_result {
         Ok(Ok(())) => {}
@@ -809,8 +810,11 @@ async fn run(
             let _ = shutdown_tx.send(());
         }
     }
-    // Ensure the HTTP handle completes too.
-    let _ = http_handle.await;
+    // Drain the HTTP handle only if it didn't already finish in the select
+    // above (avoids re-polling an already-completed JoinHandle).
+    if !http_done {
+        let _ = http_handle.await;
+    }
     if let Some(h) = public_handle {
         let _ = h.await;
     }
